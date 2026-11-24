@@ -15,6 +15,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.routing import APIRoute
 from starlette.responses import JSONResponse, RedirectResponse, Response
 
+from aiograpi_rest import compat
 from aiograpi_rest.routers import (
     account,
     album,
@@ -581,6 +582,9 @@ def _order_openapi_paths(openapi_schema: dict[str, Any]) -> None:
         ["/user/pinned/posts", "/user/highlights", "/user/stories", "/user/guides"],
     )
 
+
+
+compat.apply()
 
 app = FastAPI(
     generate_unique_id_function=generate_operation_id,
