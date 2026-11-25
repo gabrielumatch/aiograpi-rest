@@ -169,26 +169,142 @@ async def test_timeline_on_get_never_skips_warmup(tmp_path, monkeypatch):
 async def test_timeline_on_get_interval_throttles_per_session(tmp_path, monkeypatch):
     monkeypatch.setenv("AIOGRAPI_REST_TIMELINE_ON_GET", "interval")
     monkeypatch.setenv("AIOGRAPI_REST_TIMELINE_INTERVAL_SECONDS", "60")
-    storage = ClientStorage(db_path=tmp_path / "db.json", client_factory=FakeClient)
-    storage.db.insert({"sessionid": "sid", "settings": json.dumps({"x": 1})})
+    db_path = tmp_path / "db.json"
+    ClientStorage(db_path=db_path, client_factory=FakeClient).db.insert(
+        {"sessionid": "sid", "settings": json.dumps({"x": 1})}
+    )
+    now = [100.0]
+    monkeypatch.setattr("aiograpi_rest.storages.time.time", lambda: now[0])
 
-    timeline_times = [100.0, 100.0, 200.0]
-    call_count = [0]
-
-    def fake_monotonic():
-        index = min(call_count[0], len(timeline_times) - 1)
-        call_count[0] += 1
-        return timeline_times[index]
-
-    monkeypatch.setattr("aiograpi_rest.storages.time.monotonic", fake_monotonic)
-
-    first = await storage.get("sid")
-    second = await storage.get("sid")
-    third = await storage.get("sid")
+    # A new storage per request, as get_clients() does: the last warmup lives on the row.
+    first = await ClientStorage(db_path=db_path, client_factory=FakeClient).get("sid")
+    now[0] = 130.0
+    second = await ClientStorage(db_path=db_path, client_factory=FakeClient).get("sid")
+    now[0] = 200.0
+    third = await ClientStorage(db_path=db_path, client_factory=FakeClient).get("sid")
 
     assert first.timeline_called is True
     assert second.timeline_called is False
     assert third.timeline_called is True
+    row = ClientStorage(db_path=db_path, client_factory=FakeClient).db.all()[0]
+    assert row["timeline_at"] == 200.0
+
+
+@pytest.mark.asyncio
+async def test_timeline_interval_warms_again_after_clock_goes_back(tmp_path, monkeypatch):
+    monkeypatch.setenv("AIOGRAPI_REST_TIMELINE_ON_GET", "interval")
+    monkeypatch.setenv("AIOGRAPI_REST_TIMELINE_INTERVAL_SECONDS", "60")
+    storage = ClientStorage(db_path=tmp_path / "db.json", client_factory=FakeClient)
+    storage.db.insert({"sessionid": "sid", "settings": json.dumps({"x": 1}), "timeline_at": 500.0})
+    monkeypatch.setattr("aiograpi_rest.storages.time.time", lambda: 100.0)
+
+    client = await storage.get("sid")
+
+    assert client.timeline_called is True
+
+
+class RefreshingClient(FakeClient):
+    """Instagram renewed the session during the request (new token, new mid)."""
+
+    def __init__(self):
+        super().__init__()
+        self.sessionid = "123:token:1:sig"
+
+    def set_settings(self, settings):
+        self.settings = dict(settings)
+        return True
+
+    def refresh(self, **fields):
+        self.settings = {**self.settings, **fields}
+
+
+def _session_row(sessionid="123:token:1:sig", **settings):
+    base = {"cookies": {"sessionid": sessionid}, "mid": "old-mid"}
+    return {"sessionid": sessionid, "settings": json.dumps({**base, **settings}), "proxy": "http://p.example:8080"}
+
+
+@pytest.mark.asyncio
+async def test_persist_changes_saves_what_instagram_refreshed(tmp_path):
+    storage = ClientStorage(db_path=tmp_path / "db.json", client_factory=RefreshingClient)
+    storage.db.insert(_session_row())
+
+    cl = await storage.get("123:token:1:sig", warm_timeline=False)
+    cl.refresh(mid="new-mid", authorization_data={"sessionid": "123:token:1:sig2"})
+
+    assert storage.persist_changes() == 1
+    row = storage.db.all()[0]
+    saved = json.loads(row["settings"])
+    assert saved["mid"] == "new-mid"
+    assert saved["authorization_data"] == {"sessionid": "123:token:1:sig2"}
+    assert row["proxy"] == "http://p.example:8080"
+    assert storage.persist_changes() == 0  # handed clients are forgotten once saved
+
+
+@pytest.mark.asyncio
+async def test_persist_changes_keeps_the_row_when_nothing_changed(tmp_path):
+    storage = ClientStorage(db_path=tmp_path / "db.json", client_factory=RefreshingClient)
+    storage.db.insert(_session_row())
+
+    await storage.get("123:token:1:sig", warm_timeline=False)
+
+    assert storage.persist_changes() == 0
+
+
+@pytest.mark.asyncio
+async def test_persist_changes_follows_a_resigned_sessionid(tmp_path):
+    storage = ClientStorage(db_path=tmp_path / "db.json", client_factory=RefreshingClient)
+    storage.db.insert(_session_row())
+
+    cl = await storage.get("123:token:1:sig", warm_timeline=False)
+    cl.sessionid = "123%3Atoken%3A1%3Anewsig"  # the same session, signed again
+    cl.refresh(cookies={"sessionid": "123:token:1:newsig"})
+
+    assert storage.persist_changes() == 1
+    assert storage.db.all()[0]["sessionid"] == "123:token:1:sig"  # still found by its key
+
+
+@pytest.mark.asyncio
+async def test_persist_changes_never_overwrites_with_another_session(tmp_path):
+    storage = ClientStorage(db_path=tmp_path / "db.json", client_factory=RefreshingClient)
+    storage.db.insert(_session_row())
+
+    cl = await storage.get("123:token:1:sig", warm_timeline=False)
+    cl.sessionid = "999:other:1:sig"
+    cl.refresh(mid="new-mid")
+
+    assert storage.persist_changes() == 0
+    assert json.loads(storage.db.all()[0]["settings"])["mid"] == "old-mid"
+
+
+@pytest.mark.asyncio
+async def test_persist_changes_keeps_the_stored_session_cookie(tmp_path):
+    storage = ClientStorage(db_path=tmp_path / "db.json", client_factory=RefreshingClient)
+    storage.db.insert(_session_row())
+
+    cl = await storage.get("123:token:1:sig", warm_timeline=False)
+    cl.refresh(cookies={}, mid="new-mid")  # e.g. a login_required response cleared the jar
+
+    assert storage.persist_changes() == 0
+    assert json.loads(storage.db.all()[0]["settings"])["cookies"] == {"sessionid": "123:token:1:sig"}
+
+
+@pytest.mark.asyncio
+async def test_persist_changes_skips_a_deleted_session_and_survives_errors(tmp_path):
+    storage = ClientStorage(db_path=tmp_path / "db.json", client_factory=RefreshingClient)
+    storage.db.insert(_session_row())
+    cl = await storage.get("123:token:1:sig", warm_timeline=False)
+    storage.db.truncate()
+    cl.refresh(mid="new-mid")
+    assert storage.persist_changes() == 0
+
+    storage.db.insert(_session_row())
+    broken = await storage.get("123:token:1:sig", warm_timeline=False)
+
+    def boom():
+        raise RuntimeError("no settings")
+
+    broken.get_settings = boom
+    assert storage.persist_changes() == 0
 
 
 def test_get_clients_dependency_yields_storage(monkeypatch, tmp_path):
@@ -205,3 +321,68 @@ def test_get_clients_dependency_yields_storage(monkeypatch, tmp_path):
     finally:
         with pytest.raises(StopIteration):
             next(gen)
+
+
+def test_session_user_id():
+    assert ClientStorage._session_user_id("123%3Atoken%3A1%3Asig") == "123"
+    assert ClientStorage._session_user_id(None) == ""
+
+
+@pytest.mark.asyncio
+async def test_persist_changes_keeps_a_renewed_session_of_the_same_user(tmp_path):
+    storage = ClientStorage(db_path=tmp_path / "db.json", client_factory=RefreshingClient)
+    storage.db.insert(_session_row())
+
+    cl = await storage.get("123:token:1:sig", warm_timeline=False)
+    cl.sessionid = "123:newtoken:1:sig"  # Instagram handed this device a new token
+    cl.refresh(cookies={"sessionid": "123:newtoken:1:sig"})
+
+    assert storage.persist_changes() == 1
+    row = storage.db.all()[0]
+    assert row["sessionid"] == "123:token:1:sig"
+    assert json.loads(row["settings"])["cookies"] == {"sessionid": "123:newtoken:1:sig"}
+
+
+@pytest.mark.asyncio
+async def test_persist_changes_skips_a_client_without_session(tmp_path):
+    storage = ClientStorage(db_path=tmp_path / "db.json", client_factory=RefreshingClient)
+    storage.db.insert(_session_row())
+
+    cl = await storage.get("123:token:1:sig", warm_timeline=False)
+    cl.sessionid = None  # logged out
+    cl.refresh(mid="new-mid")
+
+    assert storage.persist_changes() == 0
+
+
+def test_timeline_interval_falls_back_on_a_bad_value(monkeypatch):
+    monkeypatch.setenv("AIOGRAPI_REST_TIMELINE_INTERVAL_SECONDS", "soon")
+    assert ClientStorage._timeline_interval_seconds() == 1800
+
+
+def test_atomic_storage_replaces_the_file_and_reads_by_path(tmp_path):
+    from aiograpi_rest.storages import AtomicJSONStorage
+
+    path = tmp_path / "db.json"
+    storage = AtomicJSONStorage(path)
+    assert storage.read() is None  # no file yet
+    path.write_text("  ")
+    assert storage.read() is None  # empty file
+
+    storage.write({"_default": {"1": {"sessionid": "a"}}})
+    other = AtomicJSONStorage(path)
+    other.write({"_default": {"1": {"sessionid": "b"}}})
+
+    assert storage.read() == {"_default": {"1": {"sessionid": "b"}}}
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["db.json"]
+
+
+def test_two_storages_on_one_file_see_each_other(tmp_path):
+    path = tmp_path / "db.json"
+    first = ClientStorage(db_path=path, client_factory=FakeClient)
+    second = ClientStorage(db_path=path, client_factory=FakeClient)
+
+    first.db.insert({"sessionid": "a", "settings": "{}"})
+    second.db.insert({"sessionid": "b", "settings": "{}"})
+
+    assert sorted(r["sessionid"] for r in first.db.all()) == ["a", "b"]

@@ -134,7 +134,8 @@ async def settings_get(sessionid: str = Depends(get_sessionid),
                        clients: ClientStorage = Depends(get_clients)) -> Dict:
     """Get client's settings
     """
-    cl = await clients.get(sessionid)
+    # Reading what is stored needs no call to Instagram.
+    cl = await clients.get(sessionid, warm_timeline=False)
     return cl.get_settings()
 
 
@@ -171,7 +172,14 @@ async def settings_set(settings: Optional[str] = Form(
             raise HTTPException(status_code=422, detail="settings is required when importing a new session")
         cl = clients.client()
     if settings is not None:
+        kept_proxy = ClientStorage._client_proxy(cl) if sessionid != "" else None
         cl.set_settings(json.loads(settings))
+        # Settings carry no proxy and set_settings re-inits the client: put the proxy (the new
+        # one, else the session's) back on before the first call to Instagram, so a restored
+        # session never goes out from this machine's own IP.
+        restore_proxy = (proxy or None) if proxy is not None else kept_proxy
+        if restore_proxy:
+            cl.set_proxy(restore_proxy)
         await cl.expose()
     elif proxy is None and locale is None and timezone is None:
         raise HTTPException(status_code=422, detail="settings, proxy, locale, or timezone is required")

@@ -21,6 +21,8 @@ def get_clients() -> Generator:
         clients = ClientStorage()
         yield clients
     finally:
+        # The request is over (answered or failed): keep what Instagram renewed on the session.
+        clients.persist_changes()
         clients.close()
 
 

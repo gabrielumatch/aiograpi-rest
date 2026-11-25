@@ -292,7 +292,17 @@ docker compose up api
 | Variable | Default | Behavior |
 |----------|---------|----------|
 | `AIOGRAPI_REST_TIMELINE_ON_GET` | `always` | `always` — timeline on every `get`; `interval` — at most once per session per interval; `never` — skip |
-| `AIOGRAPI_REST_TIMELINE_INTERVAL_SECONDS` | `1800` | Used when mode is `interval` (seconds between timeline calls per `sessionid`, in-process memory) |
+| `AIOGRAPI_REST_TIMELINE_INTERVAL_SECONDS` | `1800` | Used when mode is `interval` (seconds between timeline calls per `sessionid`; the last call's time is kept on the session's row, so it holds across requests and restarts) |
+
+### Session state is saved after each request
+
+Instagram renews a session as it is used: responses carry a new authorization token
+(`ig-set-authorization`), a new `mid` (`ig-set-x-mid`) and new cookies, and the client applies
+them in memory. After every request that loaded a session, the storage saves the client's
+settings again when they changed, so the next request starts from the state Instagram last
+sent instead of the one saved at login. It is skipped when the client no longer holds a session
+of the same user (a logout, a cleared cookie jar). The session store (`AIOGRAPI_REST_DB_PATH`)
+is written atomically: a temporary file, flushed, then renamed over the old one.
 
 Or run without Docker (requires Python 3.13):
 

@@ -357,6 +357,49 @@ async def test_settings_set_awaits_expose_and_persists(fake_storage):
 
 
 @pytest.mark.asyncio
+async def test_settings_set_restores_with_the_proxy_before_calling_instagram(fake_storage):
+    order = []
+    cl = fake_storage.created
+    cl.set_proxy = lambda proxy: order.append(("set_proxy", proxy))
+
+    async def expose():
+        order.append(("expose",))
+        return {"ok": True}
+
+    cl.expose = expose
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        response = await ac.patch(
+            "/auth/settings",
+            data={"settings": json.dumps({"x": 1}), "proxy": "http://proxy.example:8080"},
+        )
+
+    assert response.status_code == 200
+    assert order[:2] == [("set_proxy", "http://proxy.example:8080"), ("expose",)]
+
+
+@pytest.mark.asyncio
+async def test_settings_set_keeps_the_session_proxy_when_replacing_settings(fake_storage):
+    order = []
+    cl = fake_storage.created
+    cl.proxy = "http://kept.example:8080"
+    cl.set_proxy = lambda proxy: order.append(("set_proxy", proxy))
+
+    async def expose():
+        order.append(("expose",))
+        return {"ok": True}
+
+    cl.expose = expose
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        response = await ac.patch(
+            "/auth/settings",
+            data={"settings": json.dumps({"x": 2}), "sessionid": "sid"},
+        )
+
+    assert response.status_code == 200
+    assert order == [("set_proxy", "http://kept.example:8080"), ("expose",)]
+
+
+@pytest.mark.asyncio
 async def test_settings_set_with_existing_sessionid_reuses_client(fake_storage):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
         response = await ac.patch(
